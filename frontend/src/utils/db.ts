@@ -2,8 +2,10 @@ import Dexie, { type Table } from 'dexie'
 import type { FiberBatch } from '../types/fiber-batch'
 import type { Mould } from '../types/mould'
 import type { PaperSample } from '../types/paper-sample'
+import type { RecheckItem } from '../types/recheck'
 import type { SheetRun } from '../types/sheet-run'
 import { calculateDeviation, calculateMeshDensity } from './stripe'
+import { deriveRecheckStatus, needsRecheck } from './recheck'
 
 export function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
@@ -63,11 +65,39 @@ const seedSamples: PaperSample[] = [
   { id: 6, sampleNo: 'YZ-06', runId: 6, sizeMm: 260, stripeCount: 57, evenness: '均匀', archiveBin: '丙柜-01', schemaRev: 2 },
 ]
 
+/** 为需要复检的样本补建待复检事项；重复进入不新增，也不改动已有事项。 */
+export async function syncRecheckItems(): Promise<void> {
+  const [samples, runs, existing] = await Promise.all([
+    db.paperSamples.toArray(),
+    db.sheetRuns.toArray(),
+    db.rechecks.toArray(),
+  ])
+  const runById = new Map(runs.map((run) => [run.id, run]))
+  const linkedSampleIds = new Set(existing.map((item) => item.sampleId))
+  const today = new Date().toISOString().slice(0, 10)
+  const base = Date.UTC(1970, 0, 1)
+  const missing: RecheckItem[] = []
+  for (const sample of samples) {
+    if (sample.id === undefined || linkedSampleIds.has(sample.id)) continue
+    if (!needsRecheck(sample, runById.get(sample.runId))) continue
+    missing.push({
+      sampleId: sample.id,
+      raisedDate: today,
+      status: '待复检',
+      currentConclusion: '',
+      entries: [],
+      createdAt: base + (missing.length + 1) * 1000,
+    })
+  }
+  if (missing.length > 0) await db.rechecks.bulkAdd(missing)
+}
+
 class GbPaperMillDatabase extends Dexie {
   moulds!: Table<Mould, number>
   fiberBatches!: Table<FiberBatch, number>
   sheetRuns!: Table<SheetRun, number>
   paperSamples!: Table<PaperSample, number>
+  rechecks!: Table<RecheckItem, number>
 
   constructor() {
     super('gbpapermill-db')
@@ -96,6 +126,33 @@ class GbPaperMillDatabase extends Dexie {
         value.schemaRev = 2
       })
     })
+    this.version(3).stores({
+      moulds: '++id,&mouldNo,state,wireMaterial,schemaRev',
+      fiberBatches: '++id,&batchNo,material,beatingDegree,schemaRev',
+      sheetRuns: '++id,&runNo,mouldId,batchId,runDate,operator,schemaRev',
+      paperSamples: '++id,&sampleNo,runId,evenness,stripeCount,schemaRev',
+      rechecks: '++id,&sampleId,status,nextDate,raisedDate',
+    }).upgrade(async (transaction) => {
+      // 旧数据升级：按匀度与关联工序偏差为存量样本补建待复检事项。
+      const samples = await transaction.table<PaperSample, number>('paperSamples').toArray()
+      const runs = await transaction.table<SheetRun, number>('sheetRuns').toArray()
+      const runById = new Map(runs.map((run) => [run.id as number, run]))
+      const today = new Date().toISOString().slice(0, 10)
+      const base = Date.UTC(1970, 0, 1)
+      const items: RecheckItem[] = []
+      for (const sample of samples) {
+        if (sample.id === undefined || !needsRecheck(sample, runById.get(sample.runId))) continue
+        items.push({
+          sampleId: sample.id,
+          raisedDate: today,
+          status: '待复检',
+          currentConclusion: '',
+          entries: [],
+          createdAt: base + (items.length + 1) * 1000,
+        })
+      }
+      if (items.length > 0) await transaction.table('rechecks').bulkAdd(items)
+    })
     this.on('populate', () => this.seed())
   }
 
@@ -104,7 +161,27 @@ class GbPaperMillDatabase extends Dexie {
     await this.fiberBatches.bulkAdd(plain(seedBatches))
     await this.sheetRuns.bulkAdd(plain(seedRuns))
     await this.paperSamples.bulkAdd(plain(seedSamples))
+    await this.rechecks.bulkAdd(plain(buildSeedRechecks(seedSamples, seedRuns)))
   }
+}
+
+function buildSeedRechecks(samples: PaperSample[], runs: SheetRun[]): RecheckItem[] {
+  const runById = new Map(runs.map((run) => [run.id, run]))
+  const today = new Date().toISOString().slice(0, 10)
+  const base = Date.UTC(1970, 0, 1)
+  const items: RecheckItem[] = []
+  for (const sample of samples) {
+    if (sample.id === undefined || !needsRecheck(sample, runById.get(sample.runId))) continue
+    items.push({
+      sampleId: sample.id,
+      raisedDate: today,
+      status: deriveRecheckStatus({ entries: [] }),
+      currentConclusion: '',
+      entries: [],
+      createdAt: base + (items.length + 1) * 1000,
+    })
+  }
+  return items
 }
 
 export const db = new GbPaperMillDatabase()
