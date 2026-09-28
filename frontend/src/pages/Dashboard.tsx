@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from 'react'
+import { Link } from 'react-router-dom'
 import { Alert, Box, Card, CardContent, Chip, Divider, Grid, LinearProgress, Stack, Table, TableBody, TableCell, TableHead, TableRow, Typography } from '@mui/material'
 import { ProcessTimeline, type ProcessStep } from '../components/common/ProcessTimeline'
 import { StatBadge } from '../components/common/StatBadge'
@@ -7,7 +8,7 @@ import { useFiberStore } from '../stores/fiberStore'
 import { useMouldStore } from '../stores/mouldStore'
 import { useRunStore } from '../stores/runStore'
 import { useSampleStore } from '../stores/sampleStore'
-import { isGapOutOfTolerance } from '../utils/stripe'
+import { daysSinceLastAction, isOverSevenDays, latestRecord, nextDueDate, urgencyRank } from '../utils/recheck'
 
 function startOfCurrentWeek(): Date {
   const date = new Date()
@@ -45,25 +46,42 @@ export default function Dashboard() {
   const runError = useRunStore((state) => state.error)
   const loadRuns = useRunStore((state) => state.loadRuns)
   const samples = useSampleStore((state) => state.paperSamples)
+  const tickets = useSampleStore((state) => state.recheckTickets)
   const sampleError = useSampleStore((state) => state.error)
   const loadSamples = useSampleStore((state) => state.loadSamples)
+  const loadTickets = useSampleStore((state) => state.loadTickets)
+  const ensureRecheckTickets = useSampleStore((state) => state.ensureRecheckTickets)
 
   useEffect(() => {
-    void loadMoulds()
-    void loadBatches()
-    void loadRuns()
-    void loadSamples()
-  }, [loadBatches, loadMoulds, loadRuns, loadSamples])
+    void (async () => {
+      await Promise.all([loadMoulds(), loadBatches(), loadRuns(), loadSamples()])
+      await loadTickets()
+    })()
+  }, [loadBatches, loadMoulds, loadRuns, loadSamples, loadTickets])
+
+  // 工作台也按最新匀度与偏差复核事项（如工序实测偏差后来超差），幂等不重复建项。
+  useEffect(() => {
+    if (samples.length && runs.length) void ensureRecheckTickets(runs)
+  }, [samples, runs, ensureRecheckTickets])
 
   const { filteredMoulds: activeMoulds } = useMouldFilter(moulds, '', '在用')
   const currentWeekRuns = useMemo(() => runs.filter((run) => isInCurrentWeek(run.runDate)), [runs])
+  const sampleById = useMemo(() => new Map(samples.map((sample) => [sample.id, sample])), [samples])
   const runById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs])
-  const pendingSamples = useMemo(
-    () => samples.filter((sample) => {
-      const run = runById.get(sample.runId)
-      return sample.evenness !== '均匀' || (run ? isGapOutOfTolerance(run.deviation) : false)
-    }),
-    [runById, samples],
+  // 待复检：尚未闭环（待复检或观察中）的事项。
+  const pendingTickets = useMemo(
+    () => tickets.filter((ticket) => ticket.status !== '已闭环'),
+    [tickets],
+  )
+  // 超七天未检：建项或上次复检后逾七天仍无新记录。
+  const overdueTickets = useMemo(
+    () => pendingTickets.filter((ticket) => isOverSevenDays(ticket)),
+    [pendingTickets],
+  )
+  // 最紧急五条：超期优先，再按下一次到期日与建项时间升序。
+  const urgentTickets = useMemo(
+    () => [...pendingTickets].sort((a, b) => urgencyRank(a) - urgencyRank(b)).slice(0, 5),
+    [pendingTickets],
   )
   const activeRate = moulds.length ? Math.round((activeMoulds.length / moulds.length) * 100) : 0
   const error = mouldError ?? batchError ?? runError ?? sampleError
@@ -85,7 +103,7 @@ export default function Dashboard() {
         <StatBadge label="在册纸帘" value={moulds.length} detail={`在用 ${activeMoulds.length} 张`} />
         <StatBadge label="纤维料批" value={batches.length} detail="覆盖四类造纸纤维" tone="bamboo" />
         <StatBadge label="本周工序" value={currentWeekRuns.length} detail="按自然周统计" tone="bamboo" />
-        <StatBadge label="待复检样本" value={pendingSamples.length} detail="匀度或帘纹偏差需复核" tone={pendingSamples.length ? 'warning' : 'neutral'} />
+        <StatBadge label="待复检样本" value={pendingTickets.length} detail={`超七天未检 ${overdueTickets.length} 条`} tone={pendingTickets.length ? 'warning' : 'neutral'} />
       </Box>
 
       <Grid container spacing={2.5}>
@@ -144,45 +162,66 @@ export default function Dashboard() {
         <CardContent sx={{ p: { xs: 2, md: 3 } }}>
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, mb: 1.5 }}>
             <Box>
-              <Typography variant="h5">待复检样本</Typography>
+              <Typography variant="h5">复检提醒 · 最紧急五条</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                偏差绝对值超过 0.2 mm 或透光匀度不达“均匀”的记录标黄。
+                超七天未检优先，其次按下一次复检日期排序；历史结论以最新一条复检记录为准。
               </Typography>
             </Box>
-            <Chip label={`${pendingSamples.length} 条提醒`} color={pendingSamples.length ? 'warning' : 'success'} />
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              <Chip label={`待复检 ${pendingTickets.length}`} color={pendingTickets.length ? 'warning' : 'success'} size="small" />
+              <Chip label={`超七天 ${overdueTickets.length}`} color={overdueTickets.length ? 'warning' : 'default'} variant={overdueTickets.length ? 'filled' : 'outlined'} size="small" />
+            </Box>
           </Box>
           <Box sx={{ overflowX: 'auto' }}>
-            <Table size="small" sx={{ minWidth: 720 }}>
+            <Table size="small" sx={{ minWidth: 760 }}>
               <TableHead>
                 <TableRow>
                   <TableCell>样本号</TableCell>
                   <TableCell>对应工序</TableCell>
-                  <TableCell>匀度</TableCell>
-                  <TableCell align="right">帘纹条数</TableCell>
-                  <TableCell>帘纹偏差</TableCell>
+                  <TableCell>复检状态</TableCell>
+                  <TableCell>当前结论</TableCell>
+                  <TableCell>下次复检</TableCell>
+                  <TableCell align="right">滞留天数</TableCell>
                   <TableCell>存档位</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {pendingSamples.map((sample) => {
-                  const run = runById.get(sample.runId)
-                  const deviation = run?.deviation ?? 0
+                {urgentTickets.map((ticket) => {
+                  const sample = sampleById.get(ticket.sampleId)
+                  const run = sample ? runById.get(sample.runId) : undefined
+                  const latest = latestRecord(ticket)
+                  const due = nextDueDate(ticket)
+                  const idleDays = daysSinceLastAction(ticket)
+                  const overdue = isOverSevenDays(ticket)
                   return (
-                    <TableRow key={sample.id ?? sample.sampleNo} sx={{ bgcolor: '#fff8df' }}>
-                      <TableCell sx={{ fontWeight: 700 }}>{sample.sampleNo}</TableCell>
-                      <TableCell>{run?.runNo ?? '工序待关联'}</TableCell>
-                      <TableCell>{sample.evenness}</TableCell>
-                      <TableCell align="right">{sample.stripeCount}</TableCell>
+                    <TableRow key={ticket.id ?? ticket.sampleId} hover sx={{ bgcolor: overdue ? '#fff3cd' : '#fff8df' }} data-testid="urgent-recheck-row">
                       <TableCell>
-                        <Chip size="small" color={isGapOutOfTolerance(deviation) ? 'warning' : 'default'} label={`${deviation > 0 ? '+' : ''}${deviation.toFixed(2)} mm`} />
+                        <Box component={Link} to="/samples" sx={{ color: 'primary.main', fontWeight: 700, textDecoration: 'none' }}>
+                          {sample?.sampleNo ?? `样本 #${ticket.sampleId}`}
+                        </Box>
                       </TableCell>
-                      <TableCell>{sample.archiveBin}</TableCell>
+                      <TableCell>{run?.runNo ?? '工序待关联'}</TableCell>
+                      <TableCell>
+                        <Chip size="small" color={ticket.status === '观察中' ? 'info' : 'warning'} variant={ticket.status === '观察中' ? 'outlined' : 'filled'} label={ticket.status} />
+                      </TableCell>
+                      <TableCell>{latest ? latest.conclusion : <Typography variant="body2" color="text.secondary">尚未复检</Typography>}</TableCell>
+                      <TableCell>
+                        {due
+                          ? <Typography variant="body2" sx={{ color: overdue ? 'warning.dark' : undefined, fontWeight: overdue ? 700 : 400 }}>{due}</Typography>
+                          : '—'}
+                      </TableCell>
+                      <TableCell align="right">
+                        {idleDays !== undefined
+                          ? <Chip size="small" color={overdue ? 'warning' : 'default'} variant={overdue ? 'filled' : 'outlined'} label={`${idleDays} 天`} />
+                          : '—'}
+                      </TableCell>
+                      <TableCell>{sample?.archiveBin ?? '待归档'}</TableCell>
                     </TableRow>
                   )
                 })}
-                {pendingSamples.length === 0 && (
+                {urgentTickets.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={6} align="center" sx={{ py: 4 }}>当前没有待复检样本</TableCell>
+                    <TableCell colSpan={7} align="center" sx={{ py: 4 }}>当前没有待复检样本</TableCell>
                   </TableRow>
                 )}
               </TableBody>
